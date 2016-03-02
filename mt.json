@@ -1,0 +1,6 @@
+{
+    "name": "timeline",
+    "paths": ["."],
+    "entrypoint": "timeline",
+    "dependencies": {}
+}
