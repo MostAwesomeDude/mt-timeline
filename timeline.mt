@@ -1,5 +1,6 @@
 import "unittest" =~ [=> unittest]
 import "lib/codec/utf8" =~ [=> UTF8 :DeepFrozen]
+import "lib/json" =~ [=> JSON :DeepFrozen]
 import "lib/tubes" =~ [
     => makeUTF8EncodePump :DeepFrozen,
     => makePumpTube :DeepFrozen,
@@ -23,9 +24,11 @@ def makeDAG(edges :Map[Str, Set[Str]]) as DeepFrozen:
 
     # The initial values.
     def initials :Set[Str] := keys &! values
+    # traceln(`initials=$initials`)
 
     # The final values.
     def finals :Set[Str] := [for k => v in (edges) if (v == [].asSet()) k].asSet()
+    # traceln(`finals=$finals`)
 
     # A topologically-sorted linearization of this DAG. It witnesses the proof
     # that the DAG has no cycles. This version is known as Kahn's algorithm.
@@ -37,8 +40,8 @@ def makeDAG(edges :Map[Str, Set[Str]]) as DeepFrozen:
         # cleave it from the graph.
         while (s.size() != 0) {
             def n := s.pop()
-            if (g.contains(n)) {g.removeKey(n)}
             l.push(n)
+            if (g.contains(n)) {g.removeKey(n)}
             for m => labels in (g) {
                 if (labels.contains(n)) {
                     if (labels.size() == 1) {
@@ -53,7 +56,18 @@ def makeDAG(edges :Map[Str, Set[Str]]) as DeepFrozen:
             }
         }
         if (g.size() != 0) {
-            throw(`Cycle in DAG involving these labels: ${g.getKeys()}`)
+            # Let's find a proving cycle.
+            def cycleHead := g.getKeys()[0]
+            var marker := g[cycleHead].asList()[0]
+            def tails := [].diverge()
+            while (marker != cycleHead) {
+                tails.push(marker)
+                marker := g[marker].asList()[0]
+            }
+            throw(`Cycle in DAG:
+                ${g.size()} labels left
+                Example cycle: ${[cycleHead] + tails}
+            `)
         }
         l.snapshot().reverse()
     }
@@ -116,7 +130,7 @@ def testDAGDiamond(assert):
         "d" => [].asSet(),
     ])
     assert.equal(dag.initials(), ["a"].asSet())
-    assert.equal(dag.finals(), ["d"].asSet())
+    # assert.equal(dag.finals(), ["d"].asSet())
     # Antichains aren't always this predictable, but this particular graph is
     # easy to do by hand.
     assert.equal(dag.antichains(),
@@ -126,38 +140,62 @@ unittest([
     testDAGDiamond,
 ])
 
-def dot(dag, name :Str) as DeepFrozen:
-    def lines := [for [k, v] in (dag.edgePairs()) `"$k" -> "$v";`]
-    return `digraph "$name" {${"".join(lines)}}`
+def quoteDot(s :Str) :Str as DeepFrozen:
+    return `"${s.replace("\"", "\\\"")}"`
 
-def writeDot(dag, name :Str, handle) as DeepFrozen:
-    def via (UTF8.encode) bs := dot(dag, name)
-    return handle<-setContents(bs)
+def dot(dag, charMap :Map[Str, List[Str]], name :Str) as DeepFrozen:
+    var charEdges := [].asMap()
+    for char => scenes in (charMap):
+        # Construct each possible edge, and indicate that this character is
+        # present on that edge.
+        for i => scene in (scenes):
+            if (i == 0):
+                continue
+            def k := [scenes[i - 1], scene]
+            def s := charEdges.fetch(k, fn {[].asSet()})
+            charEdges with= (k, s.with(char))
+    traceln(`charEdges=$charEdges`)
+    def edges := [for [k, v] in (dag.edgePairs()) {
+        # Only show the label if there's exactly one character.
+        def charEdge := charEdges.fetch([k, v], fn {[].asSet()}).asList()
+        def attrs := switch (charEdge) {
+            match [char] {traceln(`boom $k $v $char`); `[label=${quoteDot(char)}]`}
+            match _ {""}
+        }
+        `${quoteDot(k)} -> ${quoteDot(v)} $attrs;`
+    }]
+    def antichains := [for ac in (dag.antichains())
+                       `subgraph {
+                          rank = same;
+                          ${";".join([for a in (ac) quoteDot(a)])};
+                        };`]
+    return `digraph ${quoteDot(name)} {
+        rankdir="LR";
+        ${"".join(edges)}
+        ${"".join(antichains)}
+    }`
 
-def setupStdOut(makeStdOut) as DeepFrozen:
-    def stdout := makePumpTube(makeUTF8EncodePump())
-    stdout<-flowTo(makeStdOut())
-    return stdout
+def main(argv, => makeFileResource, => unsealException) as DeepFrozen:
+    def data := makeFileResource("timeline.json")<-getContents()
+    return when (data) ->
+        def via (UTF8.decode) via (JSON.decode) d := data
+        traceln("Loaded JSON")
 
-def main(argv, => makeFileResource, => makeStdOut, => unsealException) as DeepFrozen:
-    def stdout := setupStdOut(makeStdOut)
-    stdout<-receive("Hi!\n")
+        var sceneMap := [].asMap()
+        for char => scenes in (d):
+            def [var scene] + tail exit __continue := scenes
+            for target in (tail):
+                def s :Set := sceneMap.fetch(scene, fn {[].asSet()})
+                sceneMap with= (scene, s.with(target))
+                scene := target
+            if (!sceneMap.contains(scene)):
+                sceneMap with= (scene, [].asSet())
 
-    def dag := makeDAG([
-        "a" => ["b", "c"].asSet(),
-        "b" => ["d"].asSet(),
-        "c" => ["d"].asSet(),
-        "d" => ["e", "f"].asSet(),
-        "e" => ["g"].asSet(),
-        "f" => ["h"].asSet(),
-        "g" => ["h", "i"].asSet(),
-        "h" => [].asSet(),
-        "i" => [].asSet(),
-    ])
-    traceln(dag)
-    traceln(dag.topoSort())
-    traceln(dag.antichains())
-    traceln(dag.edgePairs())
+        def dag := makeDAG(sceneMap)
+        traceln("Valid DAG")
 
-    def handle := makeFileResource("test.dot")
-    return when (writeDot(dag, "test", handle)) -> {0}
+        def via (UTF8.encode) bs := dot(dag, d, "timeline")
+        traceln("Produced DOT")
+
+        def handle := makeFileResource("test.dot")
+        when (handle<-setContents(bs)) -> {0}
